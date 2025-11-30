@@ -1,0 +1,5 @@
+{
+  "name": "FinAI - Smart Financial Advisor",
+  "description": "An intelligent conversational financial advisor that tracks expenses, manages budgets, and visualizes financial health using Gemini AI and a dashboard interface.",
+  "requestFramePermissions": []
+}
