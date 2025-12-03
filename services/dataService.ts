@@ -1,165 +1,294 @@
-import { Transaction, Budget, Goal, TransactionType } from '../types';
 
-/**
- * NOTE: In a production environment, this service would interact with the Google Sheets API.
- * For this implementation, we are simulating the database using LocalStorage.
- */
+import { 
+  Transaction, Budget, Goal, TransactionType, 
+  InvestmentAsset, InvestmentTransaction, InvestmentSummary, FinancialSummary
+} from '../types';
+import { db } from './firebaseConfig';
+import { 
+  collection, addDoc, updateDoc, deleteDoc, doc, 
+  query, where, getDocs, writeBatch 
+} from 'firebase/firestore';
+
+const COLLECTIONS = {
+  TRANSACTIONS: 'transactions',
+  BUDGETS: 'budgets',
+  GOALS: 'goals',
+  INVESTMENTS: 'investment_assets',
+  INVESTMENT_TXS: 'investment_transactions'
+};
 
 const STORAGE_KEYS = {
   TRANSACTIONS: 'finai_transactions',
   BUDGETS: 'finai_budgets',
   GOALS: 'finai_goals',
+  INVESTMENTS: 'finai_investments',
+  INVESTMENT_TXS: 'finai_investment_txs'
 };
 
-// Initial Seed Data (Portuguese)
-const seedData = () => {
-  if (!localStorage.getItem(STORAGE_KEYS.TRANSACTIONS)) {
-    const today = new Date();
-    const transactions: Transaction[] = [
-      { id: '1', date: new Date(today.getFullYear(), today.getMonth(), 5).toISOString(), type: TransactionType.INCOME, amount: 5000, category: 'Salário', description: 'Salário Mensal' },
-      { id: '2', date: new Date(today.getFullYear(), today.getMonth(), 6).toISOString(), type: TransactionType.EXPENSE, amount: 120, category: 'Contas', description: 'Conta de Luz' },
-      { id: '3', date: new Date(today.getFullYear(), today.getMonth(), 8).toISOString(), type: TransactionType.EXPENSE, amount: 65, category: 'Alimentação', description: 'Jantar no Mario\'s' },
-      { id: '4', date: new Date(today.getFullYear(), today.getMonth(), 10).toISOString(), type: TransactionType.EXPENSE, amount: 200, category: 'Transporte', description: 'Uber' },
-      { id: '5', date: new Date(today.getFullYear(), today.getMonth(), 12).toISOString(), type: TransactionType.EXPENSE, amount: 450, category: 'Alimentação', description: 'Compras do Mês' },
-      { id: '6', date: new Date(today.getFullYear(), today.getMonth(), 15).toISOString(), type: TransactionType.EXPENSE, amount: 150, category: 'Lazer', description: 'Cinema e Pipoca' },
-    ];
-    localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(transactions));
-  }
-
-  if (!localStorage.getItem(STORAGE_KEYS.BUDGETS)) {
-    const budgets: Budget[] = [
-      { id: '1', category: 'Alimentação', limit: 800, period: 'MONTHLY' },
-      { id: '2', category: 'Transporte', limit: 400, period: 'MONTHLY' },
-      { id: '3', category: 'Lazer', limit: 300, period: 'MONTHLY' },
-    ];
-    localStorage.setItem(STORAGE_KEYS.BUDGETS, JSON.stringify(budgets));
-  }
-
-  if (!localStorage.getItem(STORAGE_KEYS.GOALS)) {
-    const goals: Goal[] = [
-      { id: '1', name: 'Viagem Europa', targetAmount: 5000, currentAmount: 1500, deadline: '2024-12-31' },
-      { id: '2', name: 'Reserva de Emergência', targetAmount: 10000, currentAmount: 8000 },
-    ];
-    localStorage.setItem(STORAGE_KEYS.GOALS, JSON.stringify(goals));
-  }
+// Helper to get local data for migration
+const getLocal = <T>(key: string): T[] => {
+  const data = localStorage.getItem(key);
+  return data ? JSON.parse(data) : [];
 };
-
-seedData();
 
 export const DataService = {
-  getTransactions: async (): Promise<Transaction[]> => {
-    await new Promise(resolve => setTimeout(resolve, 300));
-    const data = localStorage.getItem(STORAGE_KEYS.TRANSACTIONS);
-    return data ? JSON.parse(data) : [];
+  
+  // Safe UUID generator that works in non-secure contexts (http)
+  generateUUID: (): string => {
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+      try {
+        return crypto.randomUUID();
+      } catch (e) {
+        // Fallback if crypto.randomUUID fails (e.g. insecure context)
+      }
+    }
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+      var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
+  },
+
+  // --- MIGRATION LOGIC ---
+  migrateLocalDataToFirebase: async (userId: string): Promise<void> => {
+    const batch = writeBatch(db);
+    let hasData = false;
+
+    // Transactions
+    const localTxs = getLocal<Transaction>(STORAGE_KEYS.TRANSACTIONS);
+    localTxs.forEach(tx => {
+      hasData = true;
+      const ref = doc(collection(db, COLLECTIONS.TRANSACTIONS));
+      batch.set(ref, { ...tx, userId, id: ref.id }); // Use Firestore ID
+    });
+
+    // Budgets
+    const localBudgets = getLocal<Budget>(STORAGE_KEYS.BUDGETS);
+    localBudgets.forEach(b => {
+      hasData = true;
+      const ref = doc(collection(db, COLLECTIONS.BUDGETS));
+      batch.set(ref, { ...b, userId, id: ref.id });
+    });
+
+    // Goals
+    const localGoals = getLocal<Goal>(STORAGE_KEYS.GOALS);
+    localGoals.forEach(g => {
+      hasData = true;
+      const ref = doc(collection(db, COLLECTIONS.GOALS));
+      batch.set(ref, { ...g, userId, id: ref.id });
+    });
+
+    // Investments
+    const localInvestments = getLocal<InvestmentAsset>(STORAGE_KEYS.INVESTMENTS);
+    // Need to map old IDs to new IDs for transactions
+    const assetIdMap: Record<string, string> = {}; 
+    
+    localInvestments.forEach(asset => {
+      hasData = true;
+      const ref = doc(collection(db, COLLECTIONS.INVESTMENTS));
+      assetIdMap[asset.id] = ref.id; // Map old local ID to new Firestore ID
+      batch.set(ref, { ...asset, userId, id: ref.id });
+    });
+
+    // Investment Transactions
+    const localInvTxs = getLocal<InvestmentTransaction>(STORAGE_KEYS.INVESTMENT_TXS);
+    localInvTxs.forEach(tx => {
+      hasData = true;
+      const ref = doc(collection(db, COLLECTIONS.INVESTMENT_TXS));
+      // Update assetId to the new one
+      const newAssetId = assetIdMap[tx.assetId] || tx.assetId;
+      batch.set(ref, { ...tx, userId, assetId: newAssetId, id: ref.id });
+    });
+
+    if (hasData) {
+      console.log("Migrating local data to Firebase...");
+      await batch.commit();
+      
+      // Clear Local Storage after successful migration
+      Object.values(STORAGE_KEYS).forEach(key => localStorage.removeItem(key));
+      console.log("Migration complete and local storage cleared.");
+    }
+  },
+
+  // --- Transactions ---
+  getTransactions: async (userId: string): Promise<Transaction[]> => {
+    const q = query(collection(db, COLLECTIONS.TRANSACTIONS), where("userId", "==", userId));
+    const snapshot = await getDocs(q);
+    return snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Transaction));
   },
 
   addTransaction: async (transaction: Transaction): Promise<void> => {
-    const transactions = await DataService.getTransactions();
-    transactions.push(transaction);
-    localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(transactions));
+    const { id, ...data } = transaction; // Let Firestore handle ID or use provided one
+    await addDoc(collection(db, COLLECTIONS.TRANSACTIONS), data);
   },
 
-  updateTransaction: async (updatedTransaction: Transaction): Promise<void> => {
-    const transactions = await DataService.getTransactions();
-    const index = transactions.findIndex(t => t.id === updatedTransaction.id);
-    if (index !== -1) {
-      transactions[index] = updatedTransaction;
-      localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(transactions));
-    }
+  updateTransaction: async (transaction: Transaction): Promise<void> => {
+    const ref = doc(db, COLLECTIONS.TRANSACTIONS, transaction.id);
+    await updateDoc(ref, { ...transaction });
   },
 
   deleteTransaction: async (id: string): Promise<void> => {
-    const transactions = await DataService.getTransactions();
-    const filtered = transactions.filter(t => t.id !== id);
-    localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(filtered));
+    await deleteDoc(doc(db, COLLECTIONS.TRANSACTIONS, id));
   },
 
-  getBudgets: async (): Promise<Budget[]> => {
-    const data = localStorage.getItem(STORAGE_KEYS.BUDGETS);
-    return data ? JSON.parse(data) : [];
+  // --- Budgets ---
+  getBudgets: async (userId: string): Promise<Budget[]> => {
+    const q = query(collection(db, COLLECTIONS.BUDGETS), where("userId", "==", userId));
+    const snapshot = await getDocs(q);
+    return snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Budget));
   },
 
   addBudget: async (budget: Budget): Promise<void> => {
-    const budgets = await DataService.getBudgets();
-    budgets.push(budget);
-    localStorage.setItem(STORAGE_KEYS.BUDGETS, JSON.stringify(budgets));
+    const { id, ...data } = budget;
+    await addDoc(collection(db, COLLECTIONS.BUDGETS), data);
   },
 
   updateBudget: async (updatedBudget: Budget): Promise<void> => {
-    const budgets = await DataService.getBudgets();
-    const index = budgets.findIndex(b => b.id === updatedBudget.id);
-    if (index !== -1) {
-      budgets[index] = updatedBudget;
-      localStorage.setItem(STORAGE_KEYS.BUDGETS, JSON.stringify(budgets));
-    }
+    const ref = doc(db, COLLECTIONS.BUDGETS, updatedBudget.id);
+    await updateDoc(ref, { ...updatedBudget });
   },
 
   deleteBudget: async (id: string): Promise<void> => {
-    const budgets = await DataService.getBudgets();
-    const filtered = budgets.filter(b => b.id !== id);
-    localStorage.setItem(STORAGE_KEYS.BUDGETS, JSON.stringify(filtered));
+    await deleteDoc(doc(db, COLLECTIONS.BUDGETS, id));
   },
 
-  getGoals: async (): Promise<Goal[]> => {
-    const data = localStorage.getItem(STORAGE_KEYS.GOALS);
-    return data ? JSON.parse(data) : [];
+  // --- Goals ---
+  getGoals: async (userId: string): Promise<Goal[]> => {
+    const q = query(collection(db, COLLECTIONS.GOALS), where("userId", "==", userId));
+    const snapshot = await getDocs(q);
+    return snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Goal));
   },
 
   addGoal: async (goal: Goal): Promise<void> => {
-    const goals = await DataService.getGoals();
-    goals.push(goal);
-    localStorage.setItem(STORAGE_KEYS.GOALS, JSON.stringify(goals));
+    const { id, ...data } = goal;
+    await addDoc(collection(db, COLLECTIONS.GOALS), data);
   },
 
   updateGoal: async (updatedGoal: Goal): Promise<void> => {
-    const goals = await DataService.getGoals();
-    const index = goals.findIndex(g => g.id === updatedGoal.id);
-    if (index !== -1) {
-      goals[index] = updatedGoal;
-      localStorage.setItem(STORAGE_KEYS.GOALS, JSON.stringify(goals));
-    }
+    const ref = doc(db, COLLECTIONS.GOALS, updatedGoal.id);
+    await updateDoc(ref, { ...updatedGoal });
   },
 
   deleteGoal: async (id: string): Promise<void> => {
-    const goals = await DataService.getGoals();
-    const filtered = goals.filter(g => g.id !== id);
-    localStorage.setItem(STORAGE_KEYS.GOALS, JSON.stringify(filtered));
+    await deleteDoc(doc(db, COLLECTIONS.GOALS, id));
   },
-  
-  resetData: async (): Promise<void> => {
-    // We set them to empty arrays strings instead of removing keys
-    // to prevent the seedData function from repopulating them on next load.
-    localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify([]));
-    localStorage.setItem(STORAGE_KEYS.BUDGETS, JSON.stringify([]));
-    localStorage.setItem(STORAGE_KEYS.GOALS, JSON.stringify([]));
+
+  // --- Investments ---
+  getInvestments: async (userId: string): Promise<InvestmentAsset[]> => {
+    const q = query(collection(db, COLLECTIONS.INVESTMENTS), where("userId", "==", userId));
+    const snapshot = await getDocs(q);
+    return snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as InvestmentAsset));
   },
-  
-  calculateSummary: async () => {
-    const transactions = await DataService.getTransactions();
+
+  addInvestmentAsset: async (asset: InvestmentAsset): Promise<void> => {
+    const today = new Date().toISOString().split('T')[0];
+    if (!asset.priceHistory || asset.priceHistory.length === 0) {
+        asset.priceHistory = [{ date: today, price: asset.currentPrice }];
+    }
+    const { id, ...data } = asset;
+    await addDoc(collection(db, COLLECTIONS.INVESTMENTS), data);
+  },
+
+  updateInvestmentAsset: async (asset: InvestmentAsset): Promise<void> => {
+    const ref = doc(db, COLLECTIONS.INVESTMENTS, asset.id);
+    await updateDoc(ref, { ...asset });
+  },
+
+  deleteInvestmentAsset: async (id: string): Promise<void> => {
+    await deleteDoc(doc(db, COLLECTIONS.INVESTMENTS, id));
+  },
+
+  getInvestmentTransactions: async (userId: string): Promise<InvestmentTransaction[]> => {
+    const q = query(collection(db, COLLECTIONS.INVESTMENT_TXS), where("userId", "==", userId));
+    const snapshot = await getDocs(q);
+    return snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as InvestmentTransaction));
+  },
+
+  registerInvestmentTransaction: async (tx: InvestmentTransaction, currentAsset: InvestmentAsset): Promise<void> => {
+    // 1. Save Transaction
+    const { id, ...data } = tx;
+    await addDoc(collection(db, COLLECTIONS.INVESTMENT_TXS), data);
+
+    if (tx.type === 'DIVIDEND') return;
+
+    // 2. Update Asset (Simplified logic, same as local but on Firestore)
+    // Note: In a real production app, this should be a Transaction (runTransaction)
+    let newQuantity = currentAsset.quantity;
+    let newAvgPrice = currentAsset.averagePrice;
+
+    if (tx.type === 'BUY') {
+      const totalCostOld = currentAsset.quantity * currentAsset.averagePrice;
+      const totalCostNew = tx.quantity * tx.price;
+      newQuantity = currentAsset.quantity + tx.quantity;
+      if (newQuantity > 0) {
+          newAvgPrice = (totalCostOld + totalCostNew) / newQuantity;
+      }
+    } else if (tx.type === 'SELL') {
+      newQuantity = Math.max(0, currentAsset.quantity - tx.quantity);
+    }
+
+    const updatedAsset = {
+      ...currentAsset,
+      quantity: newQuantity,
+      averagePrice: newAvgPrice,
+      updatedAt: new Date().toISOString()
+    };
     
+    const assetRef = doc(db, COLLECTIONS.INVESTMENTS, currentAsset.id);
+    await updateDoc(assetRef, updatedAsset);
+  },
+
+  updateInvestmentTransaction: async (updatedTx: InvestmentTransaction): Promise<void> => {
+    const ref = doc(db, COLLECTIONS.INVESTMENT_TXS, updatedTx.id);
+    await updateDoc(ref, { ...updatedTx });
+  },
+
+  deleteInvestmentTransaction: async (id: string): Promise<void> => {
+    await deleteDoc(doc(db, COLLECTIONS.INVESTMENT_TXS, id));
+  },
+
+  // --- Summaries ---
+
+  resetData: async (userId: string): Promise<void> => {
+    // Implement batch delete for user if needed
+    // For now, let's keep it simple as this is a dangerous operation in cloud
+    const batch = writeBatch(db);
+    
+    const collections = Object.values(COLLECTIONS);
+    for (const colName of collections) {
+        const q = query(collection(db, colName), where("userId", "==", userId));
+        const snapshot = await getDocs(q);
+        snapshot.docs.forEach(doc => {
+            batch.delete(doc.ref);
+        });
+    }
+    await batch.commit();
+  },
+  
+  // Reuse client-side calculation logic
+  calculateSummary: (transactions: Transaction[]): FinancialSummary => {
     let totalIncome = 0;
     let totalExpense = 0;
     const categoryMap: Record<string, number> = {};
     const monthlyData: Record<string, { income: number; expense: number }> = {};
-    const dailyData: Record<string, number> = {};
+    const dailyData: Record<string, { income: number; expense: number }> = {};
 
     transactions.forEach(t => {
-      const date = new Date(t.date);
-      const monthKey = date.toLocaleString('pt-BR', { month: 'short' });
-
+      const [year, month, day] = t.date.split('T')[0].split('-');
+      const dateKey = `${year}-${month}-${day}`;
+      const monthKey = new Date(Number(year), Number(month) - 1).toLocaleString('pt-BR', { month: 'short' });
+      
       if (!monthlyData[monthKey]) monthlyData[monthKey] = { income: 0, expense: 0 };
+      if (!dailyData[dateKey]) dailyData[dateKey] = { income: 0, expense: 0 };
 
       if (t.type === TransactionType.INCOME) {
         totalIncome += t.amount;
         monthlyData[monthKey].income += t.amount;
+        dailyData[dateKey].income += t.amount;
       } else {
         totalExpense += t.amount;
         monthlyData[monthKey].expense += t.amount;
         categoryMap[t.category] = (categoryMap[t.category] || 0) + t.amount;
-
-        // Daily expenses logic (sortable by ISO date key)
-        const dayKey = date.toISOString().split('T')[0]; 
-        dailyData[dayKey] = (dailyData[dayKey] || 0) + t.amount;
+        dailyData[dateKey].expense += t.amount;
       }
     });
 
@@ -174,13 +303,13 @@ export const DataService = {
       expense: monthlyData[key].expense
     }));
 
-    // Sort daily expenses by date
-    const dailyExpenses = Object.keys(dailyData).sort().map(key => {
+    const dailyHistory = Object.keys(dailyData).sort().map(key => {
         const [year, month, day] = key.split('-');
         return {
             date: `${day}/${month}`,
             originalDate: key,
-            amount: dailyData[key]
+            income: dailyData[key].income,
+            expense: dailyData[key].expense
         };
     });
 
@@ -190,7 +319,138 @@ export const DataService = {
       balance: totalIncome - totalExpense,
       expensesByCategory,
       monthlyCashflow,
-      dailyExpenses
+      dailyHistory
+    };
+  },
+
+  calculateInvestmentSummary: (assets: InvestmentAsset[], txs: InvestmentTransaction[]): InvestmentSummary => {
+    let totalInvested = 0;
+    let totalEquity = 0;
+    const typeMap: Record<string, number> = {};
+    const brokerMap: Record<string, number> = {};
+
+    // 1. Current Snapshot Calculation
+    assets.forEach(asset => {
+      const invested = asset.quantity * asset.averagePrice;
+      const equity = asset.quantity * asset.currentPrice;
+      
+      totalInvested += invested;
+      totalEquity += equity;
+
+      typeMap[asset.type] = (typeMap[asset.type] || 0) + equity;
+      brokerMap[asset.broker] = (brokerMap[asset.broker] || 0) + equity;
+    });
+
+    // 2. Dividends Calculation
+    let dividendsTotal = 0;
+    const dividendsMap: Record<string, { amount: number, sortIndex: number }> = {};
+    const recentDividends: { id: string; date: string; ticker: string; amount: number }[] = [];
+    
+    const sortedTxs = [...txs].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+    sortedTxs.forEach(tx => {
+        if (tx.type === 'DIVIDEND') {
+            dividendsTotal += tx.price; 
+            const d = new Date(tx.date);
+            const utcMonth = d.getUTCMonth();
+            const utcYear = d.getUTCFullYear();
+            
+            const displayDate = new Date(utcYear, utcMonth, 1);
+            const monthLabel = displayDate.toLocaleString('pt-BR', { month: 'short', year: '2-digit' });
+            const sortIndex = utcYear * 100 + utcMonth;
+
+            if (!dividendsMap[monthLabel]) {
+                dividendsMap[monthLabel] = { amount: 0, sortIndex: sortIndex };
+            }
+            dividendsMap[monthLabel].amount += tx.price;
+
+            const asset = assets.find(a => a.id === tx.assetId);
+            const [y, m, da] = tx.date.split('T')[0].split('-');
+            
+            recentDividends.push({
+                id: tx.id,
+                date: `${da}/${m}/${y}`,
+                ticker: asset ? asset.ticker : 'Desconhecido',
+                amount: tx.price
+            });
+        }
+    });
+
+    const dividendsHistory = Object.keys(dividendsMap)
+        .map(d => ({ date: d, amount: dividendsMap[d].amount, sortIndex: dividendsMap[d].sortIndex }))
+        .sort((a, b) => a.sortIndex - b.sortIndex);
+
+
+    // 3. Portfolio Evolution (Historical Replay)
+    const portfolioHistory: { date: string; value: number }[] = [];
+    const today = new Date();
+    
+    for (let i = 5; i >= 0; i--) {
+        const targetDate = new Date(today.getFullYear(), today.getMonth() - i + 1, 0); // End of month
+        const targetDateStr = targetDate.toISOString().split('T')[0];
+        const monthLabel = targetDate.toLocaleString('pt-BR', { month: 'short' });
+
+        let monthlyEquity = 0;
+        let monthlyDividendsAccumulated = 0;
+        
+        const assetQuantities: Record<string, number> = {};
+        
+        txs.forEach(tx => {
+            const txDate = tx.date.split('T')[0];
+            if (txDate <= targetDateStr) {
+                if (tx.type === 'BUY') {
+                    assetQuantities[tx.assetId] = (assetQuantities[tx.assetId] || 0) + tx.quantity;
+                } else if (tx.type === 'SELL') {
+                    assetQuantities[tx.assetId] = (assetQuantities[tx.assetId] || 0) - tx.quantity;
+                } else if (tx.type === 'DIVIDEND') {
+                    monthlyDividendsAccumulated += tx.price;
+                }
+            }
+        });
+
+        Object.keys(assetQuantities).forEach(assetId => {
+            const qty = assetQuantities[assetId];
+            if (qty > 0) {
+                const asset = assets.find(a => a.id === assetId);
+                if (asset) {
+                    let historicalPrice = asset.averagePrice; // Fallback
+                    // Check local priceHistory (safe check optional chain)
+                    if (asset.priceHistory?.length > 0) {
+                        const validPrices = asset.priceHistory
+                            .filter(h => h.date <= targetDateStr)
+                            .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+                        
+                        if (validPrices.length > 0) {
+                            historicalPrice = validPrices[0].price;
+                        }
+                    }
+                    monthlyEquity += qty * historicalPrice;
+                }
+            }
+        });
+
+        portfolioHistory.push({
+            date: monthLabel,
+            value: monthlyEquity + monthlyDividendsAccumulated
+        });
+    }
+
+    const totalProfit = totalEquity - totalInvested;
+    const profitability = totalInvested > 0 ? (totalProfit / totalInvested) * 100 : 0;
+
+    return {
+      totalInvested,
+      totalEquity,
+      totalProfit,
+      profitability,
+      allocationByType: Object.keys(typeMap).map(k => ({ name: k, value: typeMap[k] })),
+      allocationByBroker: Object.keys(brokerMap).map(k => ({ name: k, value: brokerMap[k] })),
+      dividendsTotal,
+      dividendsHistory,
+      recentDividends: recentDividends.slice(0, 10),
+      portfolioHistory,
+      selic: 15.00,
+      ipca: 4.65
     };
   }
 };

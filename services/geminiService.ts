@@ -1,31 +1,48 @@
+
 import { GoogleGenAI, Type, Schema, Modality } from "@google/genai";
 import { Transaction, TransactionType } from "../types";
 
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+
+// Helper to prevent Circular Structure error
+function safeStringify(obj: any) {
+  const cache = new Set();
+  return JSON.stringify(obj, (key, value) => {
+    if (typeof value === 'object' && value !== null) {
+      if (cache.has(value)) {
+        // Circular reference found, discard key
+        return;
+      }
+      // Store value in our collection
+      cache.add(value);
+    }
+    return value;
+  });
+}
 
 const transactionSchema: Schema = {
   type: Type.OBJECT,
   properties: {
     type: {
       type: Type.STRING,
-      enum: [TransactionType.EXPENSE, TransactionType.INCOME],
-      description: "Se é uma despesa (EXPENSE) ou receita (INCOME)."
+      enum: [TransactionType.EXPENSE, TransactionType.INCOME, TransactionType.DELETE],
+      description: "Se é uma despesa (EXPENSE), receita (INCOME) ou pedido de exclusão/desfazer (DELETE)."
     },
     amount: {
       type: Type.NUMBER,
-      description: "O valor numérico da transação."
+      description: "O valor numérico da transação. Para DELETE pode ser 0."
     },
     category: {
       type: Type.STRING,
-      description: "A categoria da transação (ex: Alimentação, Transporte, Salário, Contas). Infira se não for explícito."
+      description: "A categoria da transação. Para DELETE pode ser vazio."
     },
     description: {
       type: Type.STRING,
-      description: "Uma breve descrição do que foi comprado ou a fonte de renda."
+      description: "Uma breve descrição."
     },
     date: {
       type: Type.STRING,
-      description: "A data da transação no formato ISO 8601 (YYYY-MM-DD). Se o usuário disser 'hoje', use a data atual."
+      description: "A data da transação no formato ISO 8601."
     }
   },
   required: ["type", "amount", "category", "description", "date"]
@@ -78,14 +95,19 @@ export const GeminiService = {
             Data Atual: ${new Date().toISOString().split('T')[0]}.
             
             Regras:
-            1. Analise o texto do usuário para identificar se é uma despesa ou receita.
-            2. Extraia o valor.
-            3. Infira uma categoria padrão (ex: Alimentação, Transporte, Moradia, Contas, Lazer, Salário) se não especificado.
-            4. Crie uma descrição curta em português.
-            5. Determine a data.
+            1. Se o usuário quiser REGISTRAR algo:
+               - Type: EXPENSE ou INCOME
+               - Extraia valor, categoria (infira se não tiver) e descrição.
             
+            2. Se o usuário quiser DELETAR, APAGAR, REMOVER ou DESFAZER a última ação:
+               - Type: DELETE
+               - Os outros campos (amount, category) podem ser valores fictícios ou vazios.
+
             Exemplo Entrada: "Gastei 50 pila em sushi ontem"
-            Exemplo Saída JSON: { "type": "EXPENSE", "amount": 50, "category": "Alimentação", "description": "Sushi", "date": "2023-10-26" ... }
+            Exemplo Saída JSON: { "type": "EXPENSE", "amount": 50, "category": "Alimentação", "description": "Sushi", "date": "2023-10-26" }
+
+            Exemplo Entrada: "Apague a última transação"
+            Exemplo Saída JSON: { "type": "DELETE", "amount": 0, "category": "N/A", "description": "Delete request", "date": "2023-10-26" }
           `,
           responseMimeType: "application/json",
           responseSchema: transactionSchema,
@@ -94,7 +116,15 @@ export const GeminiService = {
       });
 
       if (response.text) {
-        const data = JSON.parse(response.text);
+        // Cleaning the response to avoid Markdown code blocks causing JSON parse errors
+        let cleanText = response.text.trim();
+        if (cleanText.startsWith('```json')) {
+            cleanText = cleanText.replace(/^```json/, '').replace(/```$/, '');
+        } else if (cleanText.startsWith('```')) {
+            cleanText = cleanText.replace(/^```/, '').replace(/```$/, '');
+        }
+        
+        const data = JSON.parse(cleanText);
         return {
           ...data,
           id: crypto.randomUUID(),
@@ -144,7 +174,7 @@ export const GeminiService = {
        const response = await ai.models.generateContent({
         model: "gemini-2.5-flash",
         contents: `
-          O usuário acabou de registrar esta transação: ${JSON.stringify(transaction)}.
+          O usuário acabou de registrar esta transação: ${safeStringify(transaction)}.
           Status do Orçamento: ${budgetStatus}.
           
           Gere uma resposta curta, amigável e útil em Português do Brasil confirmando que a transação foi salva.
